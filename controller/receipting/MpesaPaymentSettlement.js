@@ -1,20 +1,17 @@
 const { PrismaClient } = require('@prisma/client');
-const axios = require('axios');
 const prisma = new PrismaClient();
+const axios = require('axios');
 
-// Environment variables for SMS service
 const SMS_API_KEY = process.env.SMS_API_KEY;
 const PARTNER_ID = process.env.PARTNER_ID;
 const SHORTCODE = process.env.SHORTCODE;
 const SMS_ENDPOINT = process.env.SMS_ENDPOINT;
 
-// Generate a unique receipt number
 function generateReceiptNumber() {
     const randomDigits = Math.floor(10000 + Math.random() * 900000);
     return `RCPT${randomDigits}`;
 }
 
-// Payment Settlement Function
 const MpesaPaymentSettlement = async (req, res) => {
     const { customerId, modeOfPayment, paidBy, paymentId } = req.body;
 
@@ -23,26 +20,35 @@ const MpesaPaymentSettlement = async (req, res) => {
     }
 
     try {
-        // Use a transaction to ensure atomicity
         const result = await prisma.$transaction(async (tx) => {
-            // Step 1: Fetch customer details
+            // Step 1: Retrieve customer data
             const customer = await tx.customer.findUnique({
                 where: { id: customerId },
-                select: { closingBalance: true, phoneNumber: true, firstName: true },
+                select: { id: true, closingBalance: true, phoneNumber: true, firstName: true },
             });
+
             if (!customer) throw new Error('Customer not found.');
 
-            // Step 2: Fetch payment details
+            // Step 2: Retrieve payment data
             const payment = await tx.payment.findUnique({
                 where: { id: paymentId },
                 select: { amount: true, receipted: true },
             });
+
             if (!payment) throw new Error('Payment not found.');
             if (payment.receipted) throw new Error('Payment already receipted.');
 
             const totalAmount = payment.amount;
 
-            // Mark payment as receipted
+            // Step 3: Update customer closing balance immediately
+            const updatedClosingBalance = customer.closingBalance - totalAmount;
+
+            await tx.customer.update({
+                where: { id: customerId },
+                data: { closingBalance: updatedClosingBalance },
+            });
+
+            // Step 4: Mark the payment as receipted
             await tx.payment.update({
                 where: { id: paymentId },
                 data: { receipted: true },
@@ -50,51 +56,47 @@ const MpesaPaymentSettlement = async (req, res) => {
 
             let remainingAmount = totalAmount;
             const receipts = [];
-            let appliedToInvoices = 0;
 
-            // Step 3: Fetch unpaid or partially paid invoices
+            // Step 5: Fetch and process unpaid/partially paid invoices
             const invoices = await tx.invoice.findMany({
                 where: { customerId, OR: [{ status: 'UNPAID' }, { status: 'PPAID' }] },
                 orderBy: { createdAt: 'asc' },
             });
 
-            // Step 4: Apply payments to invoices
-            if (invoices.length > 0) {
-                for (const invoice of invoices) {
-                    if (remainingAmount <= 0) break;
+            for (const invoice of invoices) {
+                if (remainingAmount <= 0) break;
 
-                    const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
-                    const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
+                const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
+                const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
 
-                    // Update the invoice
-                    await tx.invoice.update({
-                        where: { id: invoice.id },
-                        data: {
-                            amountPaid: { increment: paymentForInvoice },
-                            status: (invoice.amountPaid + paymentForInvoice) >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
-                        },
-                    });
+                // Update invoice amountPaid and status
+                await tx.invoice.update({
+                    where: { id: invoice.id },
+                    data: {
+                        amountPaid: { increment: paymentForInvoice },
+                        status: (invoice.amountPaid + paymentForInvoice) >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
+                    },
+                });
 
-                    appliedToInvoices += paymentForInvoice;
-                    remainingAmount -= paymentForInvoice;
+                remainingAmount -= paymentForInvoice;
 
-                    // Create receipt for applied amount
-                    const receiptNumber = generateReceiptNumber();
-                    const receipt = await tx.receipt.create({
-                        data: {
-                            customerId,
-                            amount: paymentForInvoice,
-                            modeOfPayment,
-                            receiptNumber,
-                            paymentId,
-                            paidBy,
-                        },
-                    });
-                    receipts.push(receipt);
-                }
+                // Create a receipt for this invoice
+                const receiptNumber = generateReceiptNumber();
+                const receipt = await tx.receipt.create({
+                    data: {
+                        customerId,
+                        amount: paymentForInvoice,
+                        modeOfPayment,
+                        receiptNumber,
+                        paymentId,
+                        paidBy,
+                        createdAt: new Date(),
+                    },
+                });
+                receipts.push(receipt);
             }
 
-            // Step 5: Apply remaining amount directly to closing balance
+            // Step 6: Handle any remaining unmatched payment (overpayment)
             if (remainingAmount > 0) {
                 const unmatchedReceiptNumber = generateReceiptNumber();
                 const unmatchedReceipt = await tx.receipt.create({
@@ -105,54 +107,47 @@ const MpesaPaymentSettlement = async (req, res) => {
                         receiptNumber: unmatchedReceiptNumber,
                         paymentId,
                         paidBy,
+                        createdAt: new Date(),
                     },
                 });
                 receipts.push(unmatchedReceipt);
-                appliedToInvoices += remainingAmount; // Reduce closing balance
             }
 
-            // Step 6: Update customer's closing balance
-            const finalClosingBalance = customer.closingBalance - appliedToInvoices;
-            const updatedCustomer = await tx.customer.update({
-                where: { id: customerId },
-                data: { closingBalance: finalClosingBalance },
-            });
-
-            return { receipts, newClosingBalance: updatedCustomer.closingBalance };
+            return {
+                receipts,
+                newClosingBalance: updatedClosingBalance,
+            };
         });
 
-        // Success response
+        // Send success response
         res.status(201).json({
             message: 'Payment processed successfully.',
             receipts: result.receipts,
             newClosingBalance: result.newClosingBalance,
         });
 
+        // Send SMS confirmation
+        const balanceMessage = result.newClosingBalance < 0
+            ? `Your closing balance is an overpayment of KES ${Math.abs(result.newClosingBalance)}`
+            : `Your closing balance is KES ${result.newClosingBalance}`;
+        const text = `Dear Customer, payment of KES ${req.body.totalAmount} received successfully. ${balanceMessage}. Thank you!`;
+
+        await sendSMS(text, customerId);
     } catch (error) {
         console.error('Error processing payment:', error.message);
         res.status(500).json({ error: 'Failed to process payment.', details: error.message });
     }
 };
 
-// SMS Sending Function
-const sendSMS = async (text, customer) => {
+const sendSMS = async (text, customerId) => {
     try {
-        if (!customer.phoneNumber) throw new Error("Customer's phone number is missing.");
-
-        const clientsmsid = Math.floor(Math.random() * 1000000);
-
-        // Create SMS record in database
-        const smsRecord = await prisma.sms.create({
-            data: {
-                clientsmsid,
-                customerId: customer.id,
-                mobile: customer.phoneNumber,
-                message: text,
-                status: 'pending',
-            },
+        const customer = await prisma.customer.findUnique({
+            where: { id: customerId },
+            select: { phoneNumber: true },
         });
 
-        // Construct the SMS payload
+        if (!customer || !customer.phoneNumber) throw new Error('Invalid phone number.');
+
         const payload = {
             apikey: SMS_API_KEY,
             partnerID: PARTNER_ID,
@@ -161,19 +156,10 @@ const sendSMS = async (text, customer) => {
             mobile: customer.phoneNumber,
         };
 
-        console.log("Sending SMS payload:", JSON.stringify(payload));
-        const response = await axios.post(SMS_ENDPOINT, payload);
-
-        // Update SMS status to 'sent'
-        await prisma.sms.update({
-            where: { id: smsRecord.id },
-            data: { status: 'sent' },
-        });
-
-        return response.data;
+        console.log('Sending SMS:', payload);
+        await axios.post(SMS_ENDPOINT, payload);
     } catch (error) {
-        console.error('Error sending SMS:', error.message);
-        throw new Error(error.response ? error.response.data : 'Failed to send SMS.');
+        console.error('Failed to send SMS:', error.message);
     }
 };
 
