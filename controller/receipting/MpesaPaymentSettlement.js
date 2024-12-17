@@ -39,9 +39,12 @@ const MpesaPaymentSettlement = async (req, res) => {
             if (payment.receipted) throw new Error('Payment already receipted.');
 
             const totalAmount = payment.amount;
+            console.log(`this is the total amount paid ${totalAmount}`);
 
             // Step 3: Update customer closing balance immediately
             const updatedClosingBalance = customer.closingBalance - totalAmount;
+
+            console.log(`this is the total amount paid ${updatedClosingBalance}`);
 
             await tx.customer.update({
                 where: { id: customerId },
