@@ -39,17 +39,17 @@ const MpesaPaymentSettlement = async (req, res) => {
             if (payment.receipted) throw new Error('Payment already receipted.');
 
             const totalAmountPaid = payment.amount;
-            console.log(`this is the total amount paid ${totalAmountPaid}`);
+            console.log(`This is the total amount paid: ${totalAmountPaid}`);
 
-            // Step 3: Update customer closing balance immediately
+            // Step 3: Update customer closing balance immediately within the transaction
             const updatedClosingBalance = customer.closingBalance - totalAmountPaid;
+            console.log(`Updated closing balance: ${updatedClosingBalance}`);
 
-            console.log(`this is the total amount paid ${updatedClosingBalance}`);
-
-          
-
-
-        
+            // Update the customer's closing balance within the transaction
+            await tx.customer.update({
+                where: { id: customerId },
+                data: { closingBalance: updatedClosingBalance },
+            });
 
             // Step 4: Mark the payment as receipted
             await tx.payment.update({
@@ -57,7 +57,7 @@ const MpesaPaymentSettlement = async (req, res) => {
                 data: { receipted: true },
             });
 
-            let remainingAmount = totalAmount;
+            let remainingAmount = totalAmountPaid;
             const receipts = [];
 
             // Step 5: Fetch and process unpaid/partially paid invoices
@@ -122,9 +122,6 @@ const MpesaPaymentSettlement = async (req, res) => {
             };
         });
 
-
-
-
         // Send success response
         res.status(201).json({
             message: 'Payment processed successfully.',
@@ -132,17 +129,11 @@ const MpesaPaymentSettlement = async (req, res) => {
             newClosingBalance: result.newClosingBalance,
         });
 
-
-        await tx.customer.update({
-            where: { id: customerId },
-            data: { closingBalance: result.newClosingBalance },
-        });
-
         // Send SMS confirmation
         const balanceMessage = result.newClosingBalance < 0
             ? `Your closing balance is an overpayment of KES ${Math.abs(result.newClosingBalance)}`
             : `Your closing balance is KES ${result.newClosingBalance}`;
-        const text = `Dear Customer, payment of KES ${req.body.totalAmount} received successfully. ${balanceMessage}. Thank you!`;
+        const text = `Dear Customer, payment of KES ${totalAmountPaid} received successfully. ${balanceMessage}. Thank you!`;
 
         await sendSMS(text, customerId);
     } catch (error) {
