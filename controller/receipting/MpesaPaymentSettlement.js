@@ -37,13 +37,8 @@ const MpesaPaymentSettlement = async (req, res) => {
             select: { amount: true, receipted: true },
         });
 
-        if (!payment) {
-            return res.status(404).json({ message: 'Payment not found.' });
-        }
-
-        if (payment.receipted) {
-            return res.status(400).json({ message: 'Payment with this ID has already been receipted.' });
-        }
+        if (!payment) return res.status(404).json({ message: 'Payment not found.' });
+        if (payment.receipted) return res.status(400).json({ message: 'Payment already receipted.' });
 
         const totalAmount = payment.amount;
 
@@ -53,55 +48,52 @@ const MpesaPaymentSettlement = async (req, res) => {
             data: { receipted: true },
         });
 
-        // Get unpaid or partially paid invoices for the customer
+        // Process invoices
         const invoices = await prisma.invoice.findMany({
             where: { customerId, OR: [{ status: 'UNPAID' }, { status: 'PPAID' }] },
             orderBy: { createdAt: 'asc' },
         });
 
         let remainingAmount = totalAmount;
+        let appliedToInvoices = 0;
         const receipts = [];
-        const updatedInvoices = invoices.length ? [] : null;
+        const updatedInvoices = [];
 
-        // Process payment if there are unpaid or partially paid invoices
-        if (invoices.length > 0) {
-            for (const invoice of invoices) {
-                if (remainingAmount <= 0) break;
+        for (const invoice of invoices) {
+            if (remainingAmount <= 0) break;
 
-                const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
-                const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
+            const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
+            const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
 
-                const newAmountPaid = invoice.amountPaid + paymentForInvoice;
-                const newStatus = newAmountPaid >= invoice.invoiceAmount ? 'PAID' : 'PPAID';
+            const updatedInvoice = await prisma.invoice.update({
+                where: { id: invoice.id },
+                data: {
+                    amountPaid: invoice.amountPaid + paymentForInvoice,
+                    status: (invoice.amountPaid + paymentForInvoice) >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
+                },
+            });
 
-                const updatedInvoice = await prisma.invoice.update({
-                    where: { id: invoice.id },
-                    data: {
-                        amountPaid: newAmountPaid,
-                        status: newStatus,
-                    },
-                });
-                updatedInvoices.push(updatedInvoice);
+            updatedInvoices.push(updatedInvoice);
+            appliedToInvoices += paymentForInvoice;
 
-                // Create receipt for the amount applied to this invoice
-                const receiptNumber = generateReceiptNumber();
-                const receipt = await prisma.receipt.create({
-                    data: {
-                        customerId,
-                        amount: paymentForInvoice,
-                        modeOfPayment,
-                        receiptNumber,
-                        paymentId: paymentId,
-                        paidBy,
-                        createdAt: new Date(),
-                    },
-                });
-                receipts.push(receipt);
-                remainingAmount -= paymentForInvoice;
-            }
+            const receiptNumber = generateReceiptNumber();
+            const receipt = await prisma.receipt.create({
+                data: {
+                    customerId,
+                    amount: paymentForInvoice,
+                    modeOfPayment,
+                    receiptNumber,
+                    paymentId,
+                    paidBy,
+                    createdAt: new Date(),
+                },
+            });
+
+            receipts.push(receipt);
+            remainingAmount -= paymentForInvoice;
         }
 
-        // Handle remaining amount (overpayment or unmatched payments)
+        // Handle remaining amount as unmatched payment
         if (remainingAmount > 0) {
             const unmatchedReceiptNumber = generateReceiptNumber();
             const unmatchedReceipt = await prisma.receipt.create({
@@ -110,7 +102,7 @@ const MpesaPaymentSettlement = async (req, res) => {
                     amount: remainingAmount,
                     modeOfPayment,
                     receiptNumber: unmatchedReceiptNumber,
-                    paymentId: paymentId,
+                    paymentId,
                     paidBy,
                     createdAt: new Date(),
                 },
@@ -118,36 +110,29 @@ const MpesaPaymentSettlement = async (req, res) => {
             receipts.push(unmatchedReceipt);
         }
 
-        // Update closing balance
-       const balance = customer.closingBalance;
-       const finalClosingBalance = balance - totalAmount;
+        // Calculate final closing balance
+        const finalClosingBalance = customer.closingBalance - appliedToInvoices - remainingAmount;
 
-        console.log(`Updating closing balance for Customer ID: ${customerId}`);
-        console.log(`Calculated Final Closing Balance: ${finalClosingBalance}`);
+        console.log(`Final Closing Balance for Customer ID ${customerId}: ${finalClosingBalance}`);
 
-        try {
-            const updatedCustomer = await prisma.customer.update({
-                where: { id: customerId },
-                data: { closingBalance: finalClosingBalance },
-            });
-            console.log(`Closing balance updated successfully: ${updatedCustomer.closingBalance}`);
-        } catch (updateError) {
-            console.error('Error updating customer closing balance:', updateError.message);
-            throw new Error('Failed to update customer closing balance.');
-        }
+        // Update customer's closing balance
+        const updatedCustomer = await prisma.customer.update({
+            where: { id: customerId },
+            data: { closingBalance: finalClosingBalance },
+        });
 
         res.status(201).json({
             message: 'Payment processed successfully.',
             receipts,
             updatedInvoices,
-            newClosingBalance: finalClosingBalance,
+            newClosingBalance: updatedCustomer.closingBalance,
         });
 
         // Send confirmation SMS
         const balanceMessage = finalClosingBalance < 0
             ? `Your closing balance is an overpayment of KES ${Math.abs(finalClosingBalance)}`
             : `Your closing balance is KES ${finalClosingBalance}`;
-        const text = `Dear ${customer.firstName}, payment of KES ${totalAmount} for garbage collection services received successfully. ${balanceMessage}. Always use your phone number as the account number. Thank you!`;
+        const text = `Dear ${customer.firstName}, payment of KES ${totalAmount} received successfully. ${balanceMessage}. Thank you!`;
 
         await sendSMS(text, customer);
 
@@ -156,6 +141,7 @@ const MpesaPaymentSettlement = async (req, res) => {
         res.status(500).json({ error: 'Failed to process payment.', details: error.message });
     }
 };
+
 
 const sendSMS = async (text, customer) => {
     try {
