@@ -1,17 +1,20 @@
 const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
 const axios = require('axios');
+const prisma = new PrismaClient();
 
+// Environment variables for SMS service
 const SMS_API_KEY = process.env.SMS_API_KEY;
 const PARTNER_ID = process.env.PARTNER_ID;
 const SHORTCODE = process.env.SHORTCODE;
 const SMS_ENDPOINT = process.env.SMS_ENDPOINT;
 
+// Generate a unique receipt number
 function generateReceiptNumber() {
     const randomDigits = Math.floor(10000 + Math.random() * 900000);
     return `RCPT${randomDigits}`;
 }
 
+// Payment Settlement Function
 const MpesaPaymentSettlement = async (req, res) => {
     const { customerId, modeOfPayment, paidBy, paymentId } = req.body;
 
@@ -20,15 +23,16 @@ const MpesaPaymentSettlement = async (req, res) => {
     }
 
     try {
+        // Use a transaction to ensure atomicity
         const result = await prisma.$transaction(async (tx) => {
-            // Retrieve customer data
+            // Step 1: Fetch customer details
             const customer = await tx.customer.findUnique({
                 where: { id: customerId },
-                select: { id: true, closingBalance: true, phoneNumber: true, firstName: true },
+                select: { closingBalance: true, phoneNumber: true, firstName: true },
             });
             if (!customer) throw new Error('Customer not found.');
 
-            // Retrieve payment data
+            // Step 2: Fetch payment details
             const payment = await tx.payment.findUnique({
                 where: { id: paymentId },
                 select: { amount: true, receipted: true },
@@ -44,54 +48,53 @@ const MpesaPaymentSettlement = async (req, res) => {
                 data: { receipted: true },
             });
 
-            // Fetch unpaid/partially paid invoices
+            let remainingAmount = totalAmount;
+            const receipts = [];
+            let appliedToInvoices = 0;
+
+            // Step 3: Fetch unpaid or partially paid invoices
             const invoices = await tx.invoice.findMany({
                 where: { customerId, OR: [{ status: 'UNPAID' }, { status: 'PPAID' }] },
                 orderBy: { createdAt: 'asc' },
             });
 
-            let remainingAmount = totalAmount;
-            let appliedToInvoices = 0;
-            const receipts = [];
-            const updatedInvoices = [];
+            // Step 4: Apply payments to invoices
+            if (invoices.length > 0) {
+                for (const invoice of invoices) {
+                    if (remainingAmount <= 0) break;
 
-            for (const invoice of invoices) {
-                if (remainingAmount <= 0) break;
+                    const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
+                    const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
 
-                const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
-                const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
+                    // Update the invoice
+                    await tx.invoice.update({
+                        where: { id: invoice.id },
+                        data: {
+                            amountPaid: { increment: paymentForInvoice },
+                            status: (invoice.amountPaid + paymentForInvoice) >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
+                        },
+                    });
 
-                // Update invoice
-                const updatedInvoice = await tx.invoice.update({
-                    where: { id: invoice.id },
-                    data: {
-                        amountPaid: invoice.amountPaid + paymentForInvoice,
-                        status: (invoice.amountPaid + paymentForInvoice) >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
-                    },
-                });
+                    appliedToInvoices += paymentForInvoice;
+                    remainingAmount -= paymentForInvoice;
 
-                updatedInvoices.push(updatedInvoice);
-                appliedToInvoices += paymentForInvoice;
-
-                // Create receipt for this invoice
-                const receiptNumber = generateReceiptNumber();
-                const receipt = await tx.receipt.create({
-                    data: {
-                        customerId,
-                        amount: paymentForInvoice,
-                        modeOfPayment,
-                        receiptNumber,
-                        paymentId,
-                        paidBy,
-                        createdAt: new Date(),
-                    },
-                });
-
-                receipts.push(receipt);
-                remainingAmount -= paymentForInvoice;
+                    // Create receipt for applied amount
+                    const receiptNumber = generateReceiptNumber();
+                    const receipt = await tx.receipt.create({
+                        data: {
+                            customerId,
+                            amount: paymentForInvoice,
+                            modeOfPayment,
+                            receiptNumber,
+                            paymentId,
+                            paidBy,
+                        },
+                    });
+                    receipts.push(receipt);
+                }
             }
 
-            // Handle remaining unmatched payment
+            // Step 5: Apply remaining amount directly to closing balance
             if (remainingAmount > 0) {
                 const unmatchedReceiptNumber = generateReceiptNumber();
                 const unmatchedReceipt = await tx.receipt.create({
@@ -102,52 +105,28 @@ const MpesaPaymentSettlement = async (req, res) => {
                         receiptNumber: unmatchedReceiptNumber,
                         paymentId,
                         paidBy,
-                        createdAt: new Date(),
                     },
                 });
                 receipts.push(unmatchedReceipt);
+                appliedToInvoices += remainingAmount; // Reduce closing balance
             }
 
-            // Calculate and update customer's closing balance
-            const finalClosingBalance = customer.closingBalance - totalAmount;
-
-            console.log(`
-                Customer ID: ${customerId}
-                Original Closing Balance: ${customer.closingBalance}
-                Applied to Invoices: ${appliedToInvoices}
-                Remaining Amount: ${remainingAmount}
-                Final Closing Balance: ${finalClosingBalance}
-            `);
-
+            // Step 6: Update customer's closing balance
+            const finalClosingBalance = customer.closingBalance - appliedToInvoices;
             const updatedCustomer = await tx.customer.update({
                 where: { id: customerId },
                 data: { closingBalance: finalClosingBalance },
             });
 
-            // Return results
-            return {
-                receipts,
-                updatedInvoices,
-                newClosingBalance: updatedCustomer.closingBalance,
-            };
+            return { receipts, newClosingBalance: updatedCustomer.closingBalance };
         });
 
-        // Successful response after transaction
+        // Success response
         res.status(201).json({
             message: 'Payment processed successfully.',
             receipts: result.receipts,
-            updatedInvoices: result.updatedInvoices,
             newClosingBalance: result.newClosingBalance,
         });
-
-        // Send confirmation SMS
-        const balanceMessage =
-            result.newClosingBalance < 0
-                ? `Your closing balance is an overpayment of KES ${Math.abs(result.newClosingBalance)}`
-                : `Your closing balance is KES ${result.newClosingBalance}`;
-        const text = `Dear customer, payment of KES ${req.body.amount} was received successfully. ${balanceMessage}. Thank you!`;
-
-        await sendSMS(text, { phoneNumber: result.receipts[0]?.mobile, id: customerId });
 
     } catch (error) {
         console.error('Error processing payment:', error.message);
@@ -155,13 +134,14 @@ const MpesaPaymentSettlement = async (req, res) => {
     }
 };
 
+// SMS Sending Function
 const sendSMS = async (text, customer) => {
     try {
         if (!customer.phoneNumber) throw new Error("Customer's phone number is missing.");
 
         const clientsmsid = Math.floor(Math.random() * 1000000);
 
-        // Create SMS record
+        // Create SMS record in database
         const smsRecord = await prisma.sms.create({
             data: {
                 clientsmsid,
@@ -172,6 +152,7 @@ const sendSMS = async (text, customer) => {
             },
         });
 
+        // Construct the SMS payload
         const payload = {
             apikey: SMS_API_KEY,
             partnerID: PARTNER_ID,
@@ -191,7 +172,7 @@ const sendSMS = async (text, customer) => {
 
         return response.data;
     } catch (error) {
-        console.error('Error sending SMS:', error);
+        console.error('Error sending SMS:', error.message);
         throw new Error(error.response ? error.response.data : 'Failed to send SMS.');
     }
 };
