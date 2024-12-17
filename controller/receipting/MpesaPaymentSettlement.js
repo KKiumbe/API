@@ -46,13 +46,10 @@ const MpesaPaymentSettlement = async (req, res) => {
 
             console.log(`this is the total amount paid ${updatedClosingBalance}`);
 
-            const totalAmount = payment.amount;
+          
 
 
-            await tx.customer.update({
-                where: { id: customerId },
-                data: { closingBalance: updatedClosingBalance },
-            });
+        
 
             // Step 4: Mark the payment as receipted
             await tx.payment.update({
@@ -125,11 +122,20 @@ const MpesaPaymentSettlement = async (req, res) => {
             };
         });
 
+
+
+
         // Send success response
         res.status(201).json({
             message: 'Payment processed successfully.',
             receipts: result.receipts,
             newClosingBalance: result.newClosingBalance,
+        });
+
+
+        await tx.customer.update({
+            where: { id: customerId },
+            data: { closingBalance: result.newClosingBalance },
         });
 
         // Send SMS confirmation
