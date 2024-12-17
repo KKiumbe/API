@@ -109,7 +109,7 @@ const MpesaPaymentSettlement = async (req, res) => {
             }
 
             // Calculate and update customer's closing balance
-            const finalClosingBalance = Math.round(customer.closingBalance - appliedToInvoices - remainingAmount);
+            const finalClosingBalance = customer.closingBalance - totalAmount;
 
             console.log(`
                 Customer ID: ${customerId}
