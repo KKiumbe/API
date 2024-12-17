@@ -48,7 +48,7 @@ const MpesaPaymentSettlement = async (req, res) => {
             data: { receipted: true },
         });
 
-        // Process invoices
+        // Fetch unpaid/partially paid invoices
         const invoices = await prisma.invoice.findMany({
             where: { customerId, OR: [{ status: 'UNPAID' }, { status: 'PPAID' }] },
             orderBy: { createdAt: 'asc' },
@@ -65,6 +65,7 @@ const MpesaPaymentSettlement = async (req, res) => {
             const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
             const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
 
+            // Update invoice amountPaid and status
             const updatedInvoice = await prisma.invoice.update({
                 where: { id: invoice.id },
                 data: {
@@ -72,10 +73,11 @@ const MpesaPaymentSettlement = async (req, res) => {
                     status: (invoice.amountPaid + paymentForInvoice) >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
                 },
             });
-
             updatedInvoices.push(updatedInvoice);
+
             appliedToInvoices += paymentForInvoice;
 
+            // Create receipt for this invoice
             const receiptNumber = generateReceiptNumber();
             const receipt = await prisma.receipt.create({
                 data: {
@@ -93,7 +95,7 @@ const MpesaPaymentSettlement = async (req, res) => {
             remainingAmount -= paymentForInvoice;
         }
 
-        // Handle remaining amount as unmatched payment
+        // Handle unmatched payment (remaining amount)
         if (remainingAmount > 0) {
             const unmatchedReceiptNumber = generateReceiptNumber();
             const unmatchedReceipt = await prisma.receipt.create({
@@ -110,17 +112,17 @@ const MpesaPaymentSettlement = async (req, res) => {
             receipts.push(unmatchedReceipt);
         }
 
-        // Calculate final closing balance
+        // Update customer's closing balance dynamically
         const finalClosingBalance = customer.closingBalance - appliedToInvoices - remainingAmount;
 
         console.log(`Final Closing Balance for Customer ID ${customerId}: ${finalClosingBalance}`);
 
-        // Update customer's closing balance
         const updatedCustomer = await prisma.customer.update({
             where: { id: customerId },
             data: { closingBalance: finalClosingBalance },
         });
 
+        // Return response
         res.status(201).json({
             message: 'Payment processed successfully.',
             receipts,
