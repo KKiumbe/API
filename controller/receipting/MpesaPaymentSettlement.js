@@ -119,14 +119,25 @@ const MpesaPaymentSettlement = async (req, res) => {
         }
 
         // Update closing balance
-        const finalClosingBalance = invoices.length > 0
-            ? customer.closingBalance - (totalAmount - remainingAmount)
-            : customer.closingBalance - totalAmount;
+        const finalClosingBalance = parseFloat( (
+            invoices.length > 0
+                ? customer.closingBalance - (totalAmount - remainingAmount)
+                : customer.closingBalance - totalAmount
+        ).toFixed(2));
 
-        await prisma.customer.update({
-            where: { id: customerId },
-            data: { closingBalance: finalClosingBalance },
-        });
+        console.log(`Updating closing balance for Customer ID: ${customerId}`);
+        console.log(`Calculated Final Closing Balance: ${finalClosingBalance}`);
+
+        try {
+            const updatedCustomer = await prisma.customer.update({
+                where: { id: customerId },
+                data: { closingBalance: finalClosingBalance },
+            });
+            console.log(`Closing balance updated successfully: ${updatedCustomer.closingBalance}`);
+        } catch (updateError) {
+            console.error('Error updating customer closing balance:', updateError.message);
+            throw new Error('Failed to update customer closing balance.');
+        }
 
         res.status(201).json({
             message: 'Payment processed successfully.',
