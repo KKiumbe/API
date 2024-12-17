@@ -65,7 +65,7 @@ const MpesaPaymentSettlement = async (req, res) => {
             const invoiceDue = invoice.invoiceAmount - invoice.amountPaid;
             const paymentForInvoice = Math.min(remainingAmount, invoiceDue);
 
-            // Update invoice amountPaid and status
+            // Update invoice
             const updatedInvoice = await prisma.invoice.update({
                 where: { id: invoice.id },
                 data: {
@@ -73,11 +73,11 @@ const MpesaPaymentSettlement = async (req, res) => {
                     status: (invoice.amountPaid + paymentForInvoice) >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
                 },
             });
-            updatedInvoices.push(updatedInvoice);
 
+            updatedInvoices.push(updatedInvoice);
             appliedToInvoices += paymentForInvoice;
 
-            // Create receipt for this invoice
+            // Create a receipt for this invoice
             const receiptNumber = generateReceiptNumber();
             const receipt = await prisma.receipt.create({
                 data: {
@@ -95,7 +95,7 @@ const MpesaPaymentSettlement = async (req, res) => {
             remainingAmount -= paymentForInvoice;
         }
 
-        // Handle unmatched payment (remaining amount)
+        // Handle any remaining amount
         if (remainingAmount > 0) {
             const unmatchedReceiptNumber = generateReceiptNumber();
             const unmatchedReceipt = await prisma.receipt.create({
@@ -122,6 +122,8 @@ const MpesaPaymentSettlement = async (req, res) => {
             data: { closingBalance: finalClosingBalance },
         });
 
+        console.log(`Updated Closing Balance in DB: ${updatedCustomer.closingBalance}`);
+
         // Return response
         res.status(201).json({
             message: 'Payment processed successfully.',
@@ -143,6 +145,7 @@ const MpesaPaymentSettlement = async (req, res) => {
         res.status(500).json({ error: 'Failed to process payment.', details: error.message });
     }
 };
+
 
 
 const sendSMS = async (text, customer) => {
