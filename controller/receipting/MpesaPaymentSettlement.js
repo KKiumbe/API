@@ -38,13 +38,16 @@ const MpesaPaymentSettlement = async (req, res) => {
             if (!payment) throw new Error('Payment not found.');
             if (payment.receipted) throw new Error('Payment already receipted.');
 
-            const totalAmount = payment.amount;
-            console.log(`this is the total amount paid ${totalAmount}`);
+            const totalAmountPaid = payment.amount;
+            console.log(`this is the total amount paid ${totalAmountPaid}`);
 
             // Step 3: Update customer closing balance immediately
-            const updatedClosingBalance = customer.closingBalance - payment.amount;
+            const updatedClosingBalance = customer.closingBalance - totalAmountPaid;
 
             console.log(`this is the total amount paid ${updatedClosingBalance}`);
+
+            const totalAmount = payment.amount;
+
 
             await tx.customer.update({
                 where: { id: customerId },
