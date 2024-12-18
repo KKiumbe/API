@@ -69,50 +69,57 @@ async function settleInvoice() {
                 continue;
             }
 
-            const payment = await prisma.payment.create({
-                data: {
-                    amount: paymentAmount,
-                    modeOfPayment: 'MPESA',
-                    TransactionId: MpesaCode,
-                    firstName: FirstName,
-                    receipted: false,
-                    createdAt: TransTime,
-                    receiptId: null,
-                    Ref: BillRefNumber 
-                },
-            });
-
             const receiptNumber = await generateUniqueReceiptNumber();
-            const { receipts, newClosingBalance } = await processInvoices(paymentAmount, customer.id, payment.id);
 
-            const receiptData = await prisma.receipt.create({
-                data: {
-                    amount: paymentAmount,
-                    modeOfPayment: 'MPESA',
-                    paidBy: FirstName,
-                    transactionCode: MpesaCode,
-                    phoneNumber: phone,
-                    paymentId: payment.id,
-                    customerId: customer.id,
-                    receiptInvoices: {
-                        create: receipts,
+            // Start atomic transaction
+            const result = await prisma.$transaction(async (tx) => {
+                // Deduct payment amount from closing balance first
+                const updatedCustomer = await tx.customer.update({
+                    where: { id: customer.id },
+                    data: { closingBalance: customer.closingBalance - paymentAmount },
+                });
+
+                const payment = await tx.payment.create({
+                    data: {
+                        amount: paymentAmount,
+                        modeOfPayment: 'MPESA',
+                        TransactionId: MpesaCode,
+                        firstName: FirstName,
+                        receipted: false,
+                        createdAt: TransTime,
+                        receiptId: null,
+                        Ref: BillRefNumber 
                     },
-                    receiptNumber,
-                    createdAt: new Date(),
-                },
+                });
+
+                const { receipts, newClosingBalance } = await processInvoices(tx, paymentAmount, customer.id, payment.id);
+
+                const receiptData = await tx.receipt.create({
+                    data: {
+                        amount: paymentAmount,
+                        modeOfPayment: 'MPESA',
+                        paidBy: FirstName,
+                        transactionCode: MpesaCode,
+                        phoneNumber: phone,
+                        paymentId: payment.id,
+                        customerId: customer.id,
+                        receiptInvoices: {
+                            create: receipts,
+                        },
+                        receiptNumber,
+                        createdAt: new Date(),
+                    },
+                });
+
+                await tx.payment.update({
+                    where: { id: payment.id },
+                    data: { receiptId: receiptData.id },
+                });
+
+                return { finalClosingBalance: newClosingBalance, receiptData };
             });
 
-            await prisma.payment.update({
-                where: { id: payment.id },
-                data: { receiptId: receiptData.id },
-            });
-
-            await prisma.mpesaTransaction.update({
-                where: { id },
-                data: { processed: true },
-            });
-
-            const finalClosingBalance = newClosingBalance;
+            const finalClosingBalance = result.finalClosingBalance;
             const formattedBalanceMessage = finalClosingBalance < 0
                 ? `Your Current balance is an overpayment of KES ${Math.abs(finalClosingBalance)}`
                 : `Your Current balance is KES ${finalClosingBalance}`;
@@ -127,8 +134,8 @@ async function settleInvoice() {
     }
 }
 
-async function processInvoices(paymentAmount, customerId, paymentId) {
-    const invoices = await prisma.invoice.findMany({
+async function processInvoices(tx, paymentAmount, customerId, paymentId) {
+    const invoices = await tx.invoice.findMany({
         where: {
             customerId,
             status: {
@@ -141,76 +148,60 @@ async function processInvoices(paymentAmount, customerId, paymentId) {
     let remainingAmount = paymentAmount;
     const receipts = [];
 
-    const result = await prisma.$transaction(async (tx) => {
-        await tx.payment.update({
-            where: { id: paymentId },
-            data: { receipted: true },
-        });
+    await tx.payment.update({
+        where: { id: paymentId },
+        data: { receipted: true },
+    });
 
-        if (invoices.length === 0) {
-            const customer = await tx.customer.findUnique({
-                where: { id: customerId },
-                select: { closingBalance: true },
-            });
-
-            const newClosingBalance = customer.closingBalance - paymentAmount;
-
-            await tx.customer.update({
-                where: { id: customerId },
-                data: { closingBalance: newClosingBalance },
-            });
-
-            receipts.push({
-                invoiceId: null, // Indicates adjustment to closing balance
-            });
-
-            remainingAmount = 0;
-
-            return { receipts, remainingAmount, newClosingBalance };
-        }
-
-        for (const invoice of invoices) {
-            if (remainingAmount <= 0) break;
-
-            const invoiceDueAmount = invoice.invoiceAmount - invoice.amountPaid;
-            const paymentForInvoice = Math.min(remainingAmount, invoiceDueAmount);
-
-            const updatedInvoice = await tx.invoice.update({
-                where: { id: invoice.id },
-                data: {
-                    amountPaid: invoice.amountPaid + paymentForInvoice,
-                    status: invoice.amountPaid + paymentForInvoice >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
-                },
-            });
-
-            receipts.push({ invoiceId: updatedInvoice.id });
-            remainingAmount -= paymentForInvoice;
-        }
-
+    if (invoices.length === 0) {
         const customer = await tx.customer.findUnique({
             where: { id: customerId },
             select: { closingBalance: true },
         });
 
-        const newClosingBalance = customer.closingBalance - paymentAmount;
+        const newClosingBalance = customer.closingBalance;
 
-        if (remainingAmount > 0) {
-            await tx.customer.update({
-                where: { id: customerId },
-                data: { closingBalance: newClosingBalance },
-            });
-
-            receipts.push({
-                invoiceId: null, // Indicates adjustment to closing balance
-            });
-
-            remainingAmount = 0;
-        }
+        receipts.push({
+            invoiceId: null, // Indicates adjustment to closing balance
+        });
 
         return { receipts, remainingAmount, newClosingBalance };
+    }
+
+    for (const invoice of invoices) {
+        if (remainingAmount <= 0) break;
+
+        const invoiceDueAmount = invoice.invoiceAmount - invoice.amountPaid;
+        const paymentForInvoice = Math.min(remainingAmount, invoiceDueAmount);
+
+        const updatedInvoice = await tx.invoice.update({
+            where: { id: invoice.id },
+            data: {
+                amountPaid: invoice.amountPaid + paymentForInvoice,
+                status: invoice.amountPaid + paymentForInvoice >= invoice.invoiceAmount ? 'PAID' : 'PPAID',
+            },
+        });
+
+        receipts.push({ invoiceId: updatedInvoice.id });
+        remainingAmount -= paymentForInvoice;
+    }
+
+    const customer = await tx.customer.findUnique({
+        where: { id: customerId },
+        select: { closingBalance: true },
     });
 
-    return result;
+    const newClosingBalance = customer.closingBalance;
+
+    if (remainingAmount > 0) {
+        receipts.push({
+            invoiceId: null, // Indicates adjustment to closing balance
+        });
+
+        remainingAmount = 0;
+    }
+
+    return { receipts, remainingAmount, newClosingBalance };
 }
 
 function sanitizePhoneNumber(phone) {
